@@ -1,0 +1,18 @@
+package com.github.lisama569.lakehousetableformatjava.lakehouse.commit;
+
+/** 可区分的拒绝原因分类。 */
+public enum RejectReason {
+    MISSING_PRIMARY_KEY,
+    UNKNOWN_COLUMN,
+    MISSING_REQUIRED_COLUMN,
+    TYPE_MISMATCH,
+    PRIMARY_KEY_ALREADY_EXISTS,
+    SNAPSHOT_NOT_FOUND,
+    SCHEMA_VERSION_MISMATCH,
+    STALE_SNAPSHOT,
+    INVALID_SCHEMA_CHANGE,
+    COMMIT_FAILED,
+    TABLE_NOT_FOUND,
+    TABLE_ALREADY_EXISTS,
+    INVALID_REQUEST
+}
