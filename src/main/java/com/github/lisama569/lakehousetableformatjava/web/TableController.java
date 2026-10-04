@@ -1,6 +1,9 @@
 package com.github.lisama569.lakehousetableformatjava.web;
 
 import com.github.lisama569.lakehousetableformatjava.model.ColumnSpec;
+import com.github.lisama569.lakehousetableformatjava.model.DeleteRequest;
+import com.github.lisama569.lakehousetableformatjava.model.RetentionRequest;
+import com.github.lisama569.lakehousetableformatjava.model.RetentionResult;
 import com.github.lisama569.lakehousetableformatjava.model.SchemaChangeRequest;
 import com.github.lisama569.lakehousetableformatjava.model.Snapshot;
 import com.github.lisama569.lakehousetableformatjava.model.WriteRequest;
@@ -42,6 +45,16 @@ public class TableController {
     @PostMapping("/{name}/write")
     public WriteResult write(@PathVariable String name, @RequestBody WriteRequest request) {
         return tableService.write(name, request);
+    }
+
+    @PostMapping("/{name}/delete")
+    public WriteResult delete(@PathVariable String name, @RequestBody DeleteRequest request) {
+        return tableService.delete(name, request);
+    }
+
+    @PostMapping("/{name}/retention")
+    public RetentionResult expire(@PathVariable String name, @RequestBody RetentionRequest request) {
+        return tableService.expire(name, request);
     }
 
     @PostMapping("/{name}/schema")

@@ -130,4 +130,81 @@ class RestApiIntegrationTest {
                 .andExpect(jsonPath("$.errorCode").value("TABLE_NOT_FOUND"));
         LOG.warn("[rest:reject] HTTP 404 errorCode=TABLE_NOT_FOUND");
     }
+
+    @Test
+    void deleteAndRetentionOverHttp() throws Exception {
+        String createBody = """
+                {"columns":[
+                  {"name":"id","type":"LONG","nullable":false},
+                  {"name":"v","type":"STRING","nullable":true}
+                ],"primaryKey":["id"]}""";
+        mvc.perform(post("/api/tables/orders").contentType(MediaType.APPLICATION_JSON).content(createBody))
+                .andExpect(status().isOk());
+
+        mvc.perform(post("/api/tables/orders/write").contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"mode":"APPEND","expectedVersion":0,
+                                 "records":[{"id":1,"v":"a"},{"id":2,"v":"b"},{"id":3,"v":"c"}]}"""))
+                .andExpect(jsonPath("$.committed").value(true));
+
+        // 删除两条：当前不可见，历史可见
+        mvc.perform(post("/api/tables/orders/delete").contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"expectedVersion":1,"keys":[{"id":1},{"id":3}]}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.committed").value(true))
+                .andExpect(jsonPath("$.committedVersion").value(2))
+                .andExpect(jsonPath("$.acceptedCount").value(2));
+        mvc.perform(get("/api/tables/orders/rows"))
+                .andExpect(jsonPath("$.length()").value(1))
+                .andExpect(jsonPath("$[0].id").value(2));
+        mvc.perform(get("/api/tables/orders/rows?version=1"))
+                .andExpect(jsonPath("$.length()").value(3));
+        LOG.info("[rest] delete committed -> v2, current 1 row, history v1 still 3 rows");
+
+        // 删除不存在的主键：整批拒绝，原因可区分
+        mvc.perform(post("/api/tables/orders/delete").contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"expectedVersion":2,"keys":[{"id":42}]}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.committed").value(false))
+                .andExpect(jsonPath("$.rejected[0].reason").value("PRIMARY_KEY_NOT_FOUND"));
+        LOG.warn("[rest:reject] delete reason=PRIMARY_KEY_NOT_FOUND committed=false");
+
+        // 过期快照删除 -> 409
+        mvc.perform(post("/api/tables/orders/delete").contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"expectedVersion":0,"keys":[{"id":2}]}"""))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("SNAPSHOT_CONFLICT"));
+
+        // MERGE 重写为单文件 -> v3，旧文件只被历史快照引用
+        mvc.perform(post("/api/tables/orders/write").contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"mode":"MERGE","expectedVersion":2,"records":[{"id":2,"v":"b2"}]}"""))
+                .andExpect(jsonPath("$.committed").value(true))
+                .andExpect(jsonPath("$.committedVersion").value(3));
+
+        // 保留最近 1 个快照：v0..v2 过期，不再被引用的两个旧文件被删除
+        mvc.perform(post("/api/tables/orders/retention").contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"keepLastSnapshots":1}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.headVersion").value(3))
+                .andExpect(jsonPath("$.retainedSnapshotVersions[0]").value(3))
+                .andExpect(jsonPath("$.deletedDataFiles.length()").value(2));
+        mvc.perform(get("/api/tables/orders/rows"))
+                .andExpect(jsonPath("$.length()").value(1))
+                .andExpect(jsonPath("$[0].v").value("b2"));
+        mvc.perform(get("/api/tables/orders/rows?version=1"))
+                .andExpect(status().isBadRequest());
+        LOG.info("[rest] retention keepLast=1 -> expired v0..v2, head v3 still readable, v1 gone");
+
+        // 非法保留策略 -> 400
+        mvc.perform(post("/api/tables/orders/retention").contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"keepLastSnapshots":1,"retainFromVersion":2}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("INVALID_ARGUMENT"));
+    }
 }

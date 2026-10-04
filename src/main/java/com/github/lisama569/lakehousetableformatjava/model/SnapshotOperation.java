@@ -4,6 +4,7 @@ package com.github.lisama569.lakehousetableformatjava.model;
 public enum SnapshotOperation {
     APPEND,
     MERGE,
+    DELETE,
     SCHEMA_CHANGE,
     COMPACTION,
     INIT

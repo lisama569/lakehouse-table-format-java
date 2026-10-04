@@ -4,6 +4,9 @@ import com.github.lisama569.lakehousetableformatjava.exception.ConflictException
 import com.github.lisama569.lakehousetableformatjava.exception.SchemaEvolutionException;
 import com.github.lisama569.lakehousetableformatjava.model.Column;
 import com.github.lisama569.lakehousetableformatjava.model.DataFileRef;
+import com.github.lisama569.lakehousetableformatjava.model.DeleteRequest;
+import com.github.lisama569.lakehousetableformatjava.model.RetentionRequest;
+import com.github.lisama569.lakehousetableformatjava.model.RetentionResult;
 import com.github.lisama569.lakehousetableformatjava.model.Row;
 import com.github.lisama569.lakehousetableformatjava.model.Schema;
 import com.github.lisama569.lakehousetableformatjava.model.SchemaChangeRequest;
@@ -18,9 +21,11 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -127,6 +132,54 @@ public final class LocalTable implements Table {
 
     private static String newSnapshotId() {
         return UUID.randomUUID().toString();
+    }
+
+    @Override
+    public WriteResult delete(DeleteRequest request) {
+        if (request == null || request.keys() == null || request.keys().isEmpty()) {
+            throw new IllegalArgumentException("delete request and keys must not be null/empty");
+        }
+        synchronized (commitLock) {
+            long baseVersion = storage.readHeadVersion();
+            if (request.expectedVersion() != null && request.expectedVersion() != baseVersion) {
+                LOG.warn("[delete:reject] table={} reason=STALE_SNAPSHOT expectedVersion={} currentVersion={}",
+                        tableName, request.expectedVersion(), baseVersion);
+                throw new ConflictException(tableName, request.expectedVersion(), baseVersion);
+            }
+
+            Snapshot base = storage.readSnapshot(baseVersion);
+            TableData data = TableData.load(storage, base);
+            DeleteValidator.Validated validated = DeleteValidator.validate(
+                    base.schema(), request.keys(), data.keys());
+
+            // 整批拒绝：有任何非法记录就不产生任何副作用，原因逐条返回
+            if (!validated.ok()) {
+                LOG.info("[delete:reject] table={} baseVersion={} rejectedCount={} reasons={}",
+                        tableName, baseVersion, validated.rejected().size(),
+                        validated.rejected().stream().map(r -> r.reason().name()).toList());
+                return new WriteResult(false, null, null, 0L, validated.rejected());
+            }
+
+            // 删除以墓碑文件提交：不修改任何旧文件，历史快照照常复现；
+            // 墓碑的 commitVersion 高于被删行，按统一坐标规则胜出。
+            long newVersion = baseVersion + 1;
+            DataFileRef file = storage.writeDataFile(
+                    newVersion + "-delete.json", validated.tombstones(), newVersion);
+            List<DataFileRef> newFiles = new ArrayList<>(base.files());
+            newFiles.add(file);
+
+            String snapshotId = newSnapshotId();
+            Snapshot next = new Snapshot(newVersion, snapshotId, baseVersion, base.snapshotId(),
+                    base.schema(), List.copyOf(newFiles), SnapshotOperation.DELETE,
+                    System.currentTimeMillis());
+            storage.writeSnapshot(next);
+            storage.casHead(baseVersion, newVersion);
+            LOG.info("[delete:accept] table={} baseVersion={} committedVersion={} snapshotId={} deletedKeys={} basis=headCAS(base={})",
+                    tableName, baseVersion, newVersion, snapshotId, validated.tombstones().size(),
+                    baseVersion);
+            return new WriteResult(true, newVersion, snapshotId, validated.tombstones().size(),
+                    List.of());
+        }
     }
 
     @Override
@@ -287,6 +340,81 @@ public final class LocalTable implements Table {
                     tableName, baseVersion, newVersion, snapshotId, base.files().size(),
                     beforeRecords, merged.size(), baseVersion);
             return next;
+        }
+    }
+
+    @Override
+    public RetentionResult expireSnapshots(RetentionRequest request) {
+        if (request == null) {
+            throw new IllegalArgumentException("retention request must not be null");
+        }
+        // 与提交共用表级锁：回收期间不会有新提交穿插，扫描到的 HEAD 与
+        // 引用集合在删除完成前保持有效，不会删掉刚被新快照引用的文件。
+        synchronized (commitLock) {
+            long headVersion = storage.readHeadVersion();
+            Snapshot head = storage.readSnapshot(headVersion);
+            List<Snapshot> all = storage.readAllSnapshots(); // 按版本升序
+
+            // 计算保留下界：keepLastSnapshots 取倒数第 N 个快照的版本；
+            // retainFromVersion 直接作为下界。头快照无条件保留。
+            long minRetainedVersion;
+            if (request.keepLastSnapshots() != null) {
+                int n = request.keepLastSnapshots();
+                minRetainedVersion = all.size() <= n
+                        ? Long.MIN_VALUE
+                        : all.get(all.size() - n).version();
+            } else {
+                minRetainedVersion = Math.min(request.retainFromVersion(), headVersion);
+            }
+
+            List<Snapshot> retained = new ArrayList<>();
+            List<Snapshot> expired = new ArrayList<>();
+            for (Snapshot s : all) {
+                if (s.version() >= minRetainedVersion || s.version() == headVersion) {
+                    retained.add(s);
+                } else {
+                    expired.add(s);
+                }
+            }
+
+            // 被任一保留快照引用的文件一个都不能删；其余数据文件可回收。
+            Set<String> referenced = new HashSet<>();
+            for (Snapshot s : retained) {
+                for (DataFileRef f : s.files()) {
+                    referenced.add(f.path());
+                }
+            }
+            List<String> deletedFiles = new ArrayList<>();
+            List<String> retainedFiles = new ArrayList<>();
+            for (String path : storage.listDataFiles()) {
+                if (referenced.contains(path)) {
+                    retainedFiles.add(path);
+                } else {
+                    deletedFiles.add(path);
+                }
+            }
+
+            // 先清过期快照文件，再删孤儿数据文件；任一步中断都不会让
+            // 保留快照（含 HEAD）指向不存在的文件。
+            for (Snapshot s : expired) {
+                storage.deleteSnapshot(s.version());
+            }
+            for (String path : deletedFiles) {
+                storage.deleteDataFile(path);
+            }
+
+            RetentionResult result = new RetentionResult(headVersion, head.snapshotId(),
+                    expired.stream().map(Snapshot::version).toList(),
+                    retained.stream().map(Snapshot::version).toList(),
+                    deletedFiles, retainedFiles);
+            LOG.info("[retention:done] table={} headVersion={} headSnapshotId={} policy={} expiredSnapshots={} retainedSnapshots={} deletedFiles={} retainedFiles={} basis=commitLock+headReferenced",
+                    tableName, headVersion, head.snapshotId(),
+                    request.keepLastSnapshots() != null
+                            ? "keepLastSnapshots=" + request.keepLastSnapshots()
+                            : "retainFromVersion=" + request.retainFromVersion(),
+                    result.expiredSnapshotVersions(), result.retainedSnapshotVersions(),
+                    deletedFiles.size(), retainedFiles.size());
+            return result;
         }
     }
 

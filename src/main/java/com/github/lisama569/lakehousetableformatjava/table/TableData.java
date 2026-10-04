@@ -19,6 +19,10 @@ import java.util.Set;
  * 比较行的来源坐标 {@code (commitVersion, seq)}，坐标大者胜。seq 是在快照
  * 文件列表内按“文件顺序 + 文件内行序”赋的全局单调序号，保证同一提交写入的
  * 多行也有确定先后（即最后写入胜出）。
+ *
+ * <p>删除墓碑（{@link Row#deleted()}）与数据行走同一套坐标比较：墓碑坐标
+ * 更大时该主键从有效行中移除；若之后又有更高坐标的数据行（删除后重新写入
+ * 同一主键），数据行确定地胜出，结果稳定可复现。
  */
 final class TableData {
 
@@ -42,7 +46,13 @@ final class TableData {
                 String key = data.keyOf(row);
                 Entry incoming = new Entry(row, ref.maxCommitVersion(), seq++);
                 Entry existing = data.live.get(key);
-                if (existing == null || greater(incoming, existing)) {
+                if (row.deleted()) {
+                    // 墓碑：坐标大于现有行时删除该主键；否则旧数据行继续有效。
+                    // 墓碑自身不进 live 集，因此 liveRows/keys 天然不含已删主键。
+                    if (existing != null && greater(incoming, existing)) {
+                        data.live.remove(key);
+                    }
+                } else if (existing == null || greater(incoming, existing)) {
                     data.live.put(key, incoming);
                 }
             }

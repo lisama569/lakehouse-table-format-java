@@ -130,6 +130,41 @@ public final class LocalTableStorage implements TableStorage {
         return readJson(target, ROW_LIST);
     }
 
+    @Override
+    public List<String> listDataFiles() {
+        Path dataDir = tableDir.resolve("data");
+        try (Stream<Path> stream = Files.list(dataDir)) {
+            return stream
+                    .filter(Files::isRegularFile)
+                    .filter(p -> p.getFileName().toString().endsWith(".json"))
+                    .map(p -> "data/" + p.getFileName())
+                    .sorted()
+                    .toList();
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot list data files", e);
+        }
+    }
+
+    @Override
+    public void deleteDataFile(String path) {
+        Path target = path.startsWith("data/") ? tableDir.resolve(path) : tableDir.resolve("data").resolve(path);
+        try {
+            Files.deleteIfExists(target);
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot delete data file " + target, e);
+        }
+    }
+
+    @Override
+    public void deleteSnapshot(long version) {
+        Path target = snapshotPath(version);
+        try {
+            Files.deleteIfExists(target);
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot delete snapshot " + target, e);
+        }
+    }
+
     private Path snapshotPath(long version) {
         return tableDir.resolve("metadata").resolve("snap-" + version + ".json");
     }

@@ -1,6 +1,9 @@
 package com.github.lisama569.lakehousetableformatjava.service;
 
 import com.github.lisama569.lakehousetableformatjava.model.ColumnSpec;
+import com.github.lisama569.lakehousetableformatjava.model.DeleteRequest;
+import com.github.lisama569.lakehousetableformatjava.model.RetentionRequest;
+import com.github.lisama569.lakehousetableformatjava.model.RetentionResult;
 import com.github.lisama569.lakehousetableformatjava.model.SchemaChangeRequest;
 import com.github.lisama569.lakehousetableformatjava.model.Snapshot;
 import com.github.lisama569.lakehousetableformatjava.model.WriteRequest;
@@ -32,6 +35,14 @@ public class TableService {
 
     public WriteResult write(String table, WriteRequest request) {
         return catalog.openTable(table).commit(request);
+    }
+
+    public WriteResult delete(String table, DeleteRequest request) {
+        return catalog.openTable(table).delete(request);
+    }
+
+    public RetentionResult expire(String table, RetentionRequest request) {
+        return catalog.openTable(table).expireSnapshots(request);
     }
 
     public Snapshot evolve(String table, SchemaChangeRequest request) {

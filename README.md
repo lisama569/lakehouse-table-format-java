@@ -3,9 +3,10 @@
 用**本地文件系统**模拟湖仓表的元数据与数据文件，在一套对外接口（Java API + REST）
 下提供可解释、可复现的：
 
-- 按主键的**追加（APPEND）**与**合并（MERGE/upsert）**写入；
+- 按主键的**追加（APPEND）**、**合并（MERGE/upsert）**与**删除（DELETE）**写入；
 - **快照隔离**、历史版本查询与乐观并发控制（OCC）；
-- **表结构演进**（新增 / 改名 / 删除列）与**数据文件整理（compaction）**。
+- **表结构演进**（新增 / 改名 / 删除列）与**数据文件整理（compaction）**；
+- 按保留策略**回收历史快照与孤儿数据文件（retention）**。
 
 所有结论都以「提交版本 + 快照标识 + 判定依据」的形式出现在日志与返回体中。
 
@@ -26,6 +27,7 @@ lakehouse-warehouse/<table>/
   data/
     1-0.json             # 不可变数据文件：行按「列 ID -> 值」序列化（JSON）
     2-0.json
+    3-delete.json        # 删除提交的墓碑文件（行带 deleted=true，只含主键列）
     5-compact.json       # compaction 重写出的新文件
 ```
 
@@ -72,7 +74,37 @@ lakehouse-warehouse/<table>/
 
 这保证了「后提交 / 后写入」的行确定性胜出，且 compaction 前后查询结果逐字节一致。
 
-### 2.4 时间旅行（历史版本）
+### 2.4 按主键删除（DELETE）
+
+`delete(DeleteRequest)` 一次可删除多条记录，语义与写入完全对齐：
+
+- **墓碑提交**：删除不修改任何旧文件，而是写一个只含主键列、`deleted=true`
+  的墓碑文件，并生成 `operation=DELETE` 的新快照（文件列表 = 旧列表 + 墓碑文件）。
+- **可见性**：墓碑与数据行走 §2.3 同一套 `(commitVersion, seq)` 坐标规则。
+  墓碑的提交版本高于被删行，因此**当前快照不再可见这些主键**；
+  历史快照仍引用旧文件、不含墓碑，**删除之前的版本照常可读**，不会被一起抹掉。
+- **删除后重写同一主键**：删除只作用于其基版本之前的行。之后以更高提交版本
+  APPEND/MERGE 同一主键时，数据行确定地胜过墓碑（APPEND 也不再判定
+  「主键已存在」，因为已删主键不在有效键集合中）。规则唯一、结果稳定可复现。
+- **整批校验，all-or-nothing**：任一记录非法则整批拒绝、不产生任何文件或
+  新版本，原因逐条可区分（在 §3 表格中）：
+  批内重复主键 `DUPLICATE_PRIMARY_KEY_IN_BATCH`、
+  主键不存在 `PRIMARY_KEY_NOT_FOUND`、
+  缺主键 `MISSING_PRIMARY_KEY`、主键类型不符 `TYPE_MISMATCH`、
+  未知列 `UNKNOWN_COLUMN`。
+- 删除同样走表级锁 + OCC（`DeleteRequest.expectedVersion`），
+  过期基版本得到 `ConflictException`（HTTP 409）。
+
+### 2.5 删除与演进、整理的配合
+
+- **与 compaction**：整理用与查询完全相同的合并规则，墓碑在重写时生效，
+  被删行不会写进新文件——**整理后已删行不会复活**；旧文件不动，历史快照不受影响。
+- **与结构演进**：删除只按主键列定位行，主键列 ID 稳定；删行 / 加列 / 改名 /
+  删列任意穿插后，**每个历史快照仍按它当时的 schema 把值原样读出**
+  （列 ID 寻址保证不会把一列的值读到另一列上）。注意：主键列不允许 DROP，
+  也不允许 RENAME（演进后主键必须仍能解析，否则演进被拒绝）。
+
+### 2.6 时间旅行（历史版本）
 
 - `readAt(version)` / `GET /rows?version=N` 读取任一已提交快照；
 - 因为旧文件不删除、快照自带 schema 与文件清单，**任一已提交快照其后都可一致复现**
@@ -93,6 +125,7 @@ lakehouse-warehouse/<table>/
 | `MISSING_REQUIRED_COLUMN` | 非主键列缺失，且列 NOT NULL 又无缺省值 |
 | `PRIMARY_KEY_ALREADY_EXISTS` | APPEND 命中已存在主键 |
 | `DUPLICATE_PRIMARY_KEY_IN_BATCH` | 同一批次内主键重复 |
+| `PRIMARY_KEY_NOT_FOUND` | DELETE 要删的主键在当前快照中不存在 |
 
 类型规范化严格且确定：整数可写 LONG/DOUBLE，但小数写 LONG、字符串写数字/布尔
 都会被拒绝；`null` 对可空列合法。缺省值以字符串在 schema 中保存，按列类型解析。
@@ -131,7 +164,33 @@ REST 层把领域异常映射为可区分状态码：`404 TABLE_NOT_FOUND`、
 
 ---
 
-## 6. 对外接口
+## 6. 保留与回收（Retention）
+
+`expireSnapshots(RetentionRequest)` 按保留策略清理历史，回收磁盘空间。
+两种策略**恰好指定一个**（否则 400 `INVALID_ARGUMENT`）：
+
+| 策略 | 含义 |
+|---|---|
+| `keepLastSnapshots=N`（N≥1） | 只保留最近 N 个快照（含当前头快照） |
+| `retainFromVersion=V`（V≥0） | 保留版本号 ≥ V 的全部快照 |
+
+规则与不变量：
+
+1. **头快照无条件保留**：`retainFromVersion` 大于头版本时按头版本处理，
+   当前快照永远不会指向一个不存在的文件。
+2. 过期快照文件被删除；**不再被任何保留快照引用的数据文件**随之删除，
+   被保留快照引用的文件一个都不动。
+3. **保留范围内的历史查询结果与回收前逐条一致**（有测试逐版本比对）；
+   过期版本再查询会得到 `400 INVALID_ARGUMENT`（快照不存在）。
+4. **与并发提交安全共存**：回收与提交共用同一把表级锁，HEAD 与引用集合在
+   锁内一次性确定，不会删掉刚好被新快照引用的文件；先删过期快照文件、
+   再删孤儿数据文件，任一步中断都不破坏保留快照（含 HEAD）的完整性。
+5. 回收结果 `RetentionResult` 带回头版本、头快照标识、过期/保留版本清单、
+   被删/被留文件清单，日志同步打印判定依据。
+
+---
+
+## 7. 对外接口
 
 ### Java API
 
@@ -148,10 +207,13 @@ r.committed(); r.committedVersion(); r.snapshotId(); r.rejected();
 
 t.readLatest();      // 当前头快照
 t.readAt(1);         // 历史版本
+t.delete(new DeleteRequest(1L, List.of(Map.of("id", 1)))); // 按主键删除
 t.evolve(new SchemaChangeRequest(1L,
         List.of(new ColumnChange(Kind.ADD, "note", null,
                 new ColumnSpec("note", DataType.STRING, true, null)))));
 t.compact();
+t.expireSnapshots(new RetentionRequest(5, null));   // 只保留最近 5 个快照
+// 或 new RetentionRequest(null, 3L)                // 保留版本 >= 3 的快照
 t.history();         // 全部已提交快照
 ```
 
@@ -161,17 +223,19 @@ t.history();         // 全部已提交快照
 |---|---|
 | `POST /api/tables/{name}` | 建表，body：`{columns:[{name,type,nullable,defaultValue}], primaryKey:[...]}`，返回初始快照 |
 | `POST /api/tables/{name}/write` | 写入，body：`{mode:APPEND|MERGE, expectedVersion, records:[{列名:值}]}` |
+| `POST /api/tables/{name}/delete` | 按主键删除，body：`{expectedVersion, keys:[{主键列:值}]}`，返回同写入结果 |
 | `POST /api/tables/{name}/schema` | 结构演进，body：`{expectedVersion, changes:[{kind:ADD|RENAME|DROP, columnName, newName, spec}]}` |
 | `POST /api/tables/{name}/compact` | 整理数据文件 |
+| `POST /api/tables/{name}/retention` | 保留回收，body：`{keepLastSnapshots}` 或 `{retainFromVersion}`（二选一） |
 | `GET  /api/tables/{name}/rows?version=N` | 查询（省略 version 读头快照） |
 | `GET  /api/tables/{name}/history` | 快照历史 |
 
 ---
 
-## 7. 验证方法
+## 8. 验证方法
 
 ```bash
-mvn test          # 运行全部 20 个测试
+mvn test          # 运行全部 32 个测试
 ```
 
 测试与覆盖点：
@@ -183,15 +247,20 @@ mvn test          # 运行全部 20 个测试
 | `SnapshotIsolationTest` | 每版可复现（含重开 catalog）、过期快照拒绝、演进 OCC |
 | `ConcurrentCommitTest` | 8 线程同基版本竞争：恰一成功、其余 SNAPSHOT_CONFLICT；刷新重试全部落地 |
 | `SchemaEvolutionTest` | ADD 缺省语义、RENAME 不错列、DROP 历史可读、非法演进、compaction 前后一致 |
-| `RestApiIntegrationTest` | HTTP 全生命周期与可区分错误码 |
+| `DeleteTest` | 删除可见性与历史保留、三类非法删除可区分且整批原子、删后重写规则、整理后不复活、与演进穿插不错列、旧格式文件兼容 |
+| `RetentionTest` | keepLast/retainFromVersion 两种策略、保留范围逐条一致、引用文件零误删、头快照钉住、并发提交与回收竞争、策略参数校验 |
+| `RestApiIntegrationTest` | HTTP 全生命周期（含删除与回收）与可区分错误码 |
 
 测试日志会打印**提交版本、快照标识（snapshotId）与判定依据**，例如：
 
 ```
 [commit:accept] table=orders mode=APPEND baseVersion=0 committedVersion=1 snapshotId=... records=2 basis=headCAS(base=0)
+[delete:accept] table=orders baseVersion=1 committedVersion=2 snapshotId=... deletedKeys=2 basis=headCAS(base=1)
+[delete:reject] table=orders baseVersion=1 rejectedCount=3 reasons=[DUPLICATE_PRIMARY_KEY_IN_BATCH, PRIMARY_KEY_NOT_FOUND, MISSING_PRIMARY_KEY]
 [concurrent:reject] id=3 reason=SNAPSHOT_CONFLICT expectedVersion=0 currentVersion=1 basis=OCC
 [evolve] RENAME label->title columnId=2: history v1 reads label, head v2 reads title ...
 [compact] files 3->1, liveRows=4 ... results identical; history v1 still reproduces old value
+[retention:done] table=orders headVersion=5 policy=keepLastSnapshots=2 expiredSnapshots=[0,1,2,3] retainedSnapshots=[4,5] deletedFiles=3 retainedFiles=2 basis=commitLock+headReferenced
 ```
 
 查看某次测试的日志输出可直接运行：
@@ -202,10 +271,25 @@ mvn test -Dtest=ConcurrentCommitTest
 
 ---
 
-## 8. 设计取舍小结
+## 9. 兼容范围
+
+- **旧格式数据文件**：引入删除前行 JSON 没有 `deleted` 字段；反序列化时缺失
+  一律按 `false` 处理，旧文件无需迁移即可继续读取、参与合并与删除
+  （`DeleteTest.legacyDataFilesWithoutDeletedFlagRemainReadable` 验证）。
+- **快照文件**：快照结构未变，历史仓库的 `snap-*.json` 原样可用。
+- **API**：新增接口（`delete` / `expireSnapshots` / REST 两个端点）均为纯增量，
+  原有写入、演进、整理、查询语义不变（原有 20 个测试全部无回归）。
+
+---
+
+## 10. 设计取舍小结
 
 - **表级锁 + OCC + 原子 HEAD**：单 JVM 内由锁串行化，跨进程由原子 CAS 兜底，
   冲突可解释且绝不丢已提交数据。
 - **列 ID 寻址**：把「数据身份」与「列名」解耦，是改名/删列不错列、历史可复现的根因。
 - **不可变文件 + 快照清单**：时间旅行与可重复读几乎零额外成本；compaction 只影响
   新快照，旧版本安然无恙。
+- **墓碑删除**：删除也是一次普通提交（新文件 + 新快照），复用统一的合并坐标规则，
+  因此当前可见性、历史保留、整理不复活、删后重写都由同一条规则推出，没有特例。
+- **回收不碰引用**：保留集（含头快照）引用的文件是删除的禁区；锁内确定引用集合，
+  是与并发提交安全共存的关键。

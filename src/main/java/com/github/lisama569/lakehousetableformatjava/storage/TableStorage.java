@@ -29,4 +29,13 @@ public interface TableStorage {
 
     /** 读取数据文件中的全部行（列 ID -> 值）。 */
     List<Row> readDataFile(String path);
+
+    /** 列出数据目录下全部数据文件的相对路径（data/ 开头）。 */
+    List<String> listDataFiles();
+
+    /** 删除一个不再被任何保留快照引用的数据文件。 */
+    void deleteDataFile(String path);
+
+    /** 删除一个已过期的快照文件。 */
+    void deleteSnapshot(long version);
 }
