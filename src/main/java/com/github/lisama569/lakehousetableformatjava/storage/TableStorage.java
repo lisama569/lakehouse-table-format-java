@@ -29,4 +29,13 @@ public interface TableStorage {
 
     /** 读取数据文件中的全部行（列 ID -> 值）。 */
     List<Row> readDataFile(String path);
+
+    /** 物理删除一个快照文件（vacuum 用）；文件不存在时为空操作。 */
+    void deleteSnapshotFile(long version);
+
+    /** 物理删除一个数据文件（vacuum 用）；文件不存在时为空操作。 */
+    void deleteDataFile(String path);
+
+    /** 列出 data 目录下现存的数据文件相对路径（data/ 前缀）。 */
+    List<String> listDataFiles();
 }

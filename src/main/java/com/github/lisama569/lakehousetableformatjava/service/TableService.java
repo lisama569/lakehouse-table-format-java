@@ -42,6 +42,16 @@ public class TableService {
         return catalog.openTable(table).compact();
     }
 
+    public WriteResult delete(String table,
+                              com.github.lisama569.lakehousetableformatjava.model.DeleteRequest request) {
+        return catalog.openTable(table).delete(request);
+    }
+
+    public com.github.lisama569.lakehousetableformatjava.model.VacuumResult vacuum(
+            String table, com.github.lisama569.lakehousetableformatjava.model.RetentionPolicy policy) {
+        return catalog.openTable(table).vacuum(policy);
+    }
+
     /** version 为 null 时读头快照，否则读指定历史版本。 */
     public List<Map<String, Object>> read(String table, Long version) {
         Table t = catalog.openTable(table);

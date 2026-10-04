@@ -130,4 +130,70 @@ class RestApiIntegrationTest {
                 .andExpect(jsonPath("$.errorCode").value("TABLE_NOT_FOUND"));
         LOG.warn("[rest:reject] HTTP 404 errorCode=TABLE_NOT_FOUND");
     }
+
+    @Test
+    void deleteAndVacuumOverHttp() throws Exception {
+        // 建表并写入三行：v1
+        String createBody = """
+                {"columns":[
+                  {"name":"id","type":"LONG","nullable":false},
+                  {"name":"v","type":"STRING","nullable":true}
+                ],"primaryKey":["id"]}""";
+        mvc.perform(post("/api/tables/events").contentType(MediaType.APPLICATION_JSON).content(createBody))
+                .andExpect(status().isOk());
+        String write = """
+                {"mode":"APPEND","expectedVersion":0,"records":[{"id":1,"v":"a"},{"id":2,"v":"b"},{"id":3,"v":"c"}]}""";
+        mvc.perform(post("/api/tables/events/write").contentType(MediaType.APPLICATION_JSON).content(write))
+                .andExpect(jsonPath("$.committed").value(true))
+                .andExpect(jsonPath("$.committedVersion").value(1));
+
+        // 删除不存在的键 -> 200 committed=false，原因可区分
+        String deleteMissing = """
+                {"expectedVersion":1,"keys":[{"id":99}]}""";
+        mvc.perform(post("/api/tables/events/delete").contentType(MediaType.APPLICATION_JSON).content(deleteMissing))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.committed").value(false))
+                .andExpect(jsonPath("$.rejected[0].reason").value("PRIMARY_KEY_NOT_FOUND"));
+        LOG.warn("[rest:reject] DELETE missing key reason=PRIMARY_KEY_NOT_FOUND committed=false");
+
+        // 合法批量删除 id=1,3 -> v2，头快照只剩 id=2
+        String deleteOk = """
+                {"expectedVersion":1,"keys":[{"id":1},{"id":3}]}""";
+        mvc.perform(post("/api/tables/events/delete").contentType(MediaType.APPLICATION_JSON).content(deleteOk))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.committed").value(true))
+                .andExpect(jsonPath("$.committedVersion").value(2))
+                .andExpect(jsonPath("$.acceptedCount").value(2));
+        mvc.perform(get("/api/tables/events/rows"))
+                .andExpect(jsonPath("$.length()").value(1))
+                .andExpect(jsonPath("$[0].id").value(2));
+        // 历史 v1 仍有三行
+        mvc.perform(get("/api/tables/events/rows?version=1"))
+                .andExpect(jsonPath("$.length()").value(3));
+        LOG.info("[rest] DELETE accepted -> v2; head has only id=2; history v1 keeps 3 rows");
+
+        // 删除的过期快照冲突 -> 409
+        String deleteStale = """
+                {"expectedVersion":1,"keys":[{"id":2}]}""";
+        mvc.perform(post("/api/tables/events/delete").contentType(MediaType.APPLICATION_JSON).content(deleteStale))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("SNAPSHOT_CONFLICT"));
+
+        // 回收：保留最近 2 个快照（v1,v2），v0 过期
+        mvc.perform(post("/api/tables/events/vacuum").contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"retainLastSnapshots\":2}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.expiredSnapshots[0]").value(0))
+                .andExpect(jsonPath("$.headVersionAtEnd").value(2));
+        // 保留范围内查询不变
+        mvc.perform(get("/api/tables/events/rows?version=1"))
+                .andExpect(jsonPath("$.length()").value(3));
+        mvc.perform(get("/api/tables/events/rows"))
+                .andExpect(jsonPath("$[0].id").value(2));
+        // 非法策略 -> 400 INVALID_ARGUMENT
+        mvc.perform(post("/api/tables/events/vacuum").contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("INVALID_ARGUMENT"));
+        LOG.info("[rest] VACUUM retainLast=2 expired v0; retained rows identical; empty policy -> 400");
+    }
 }

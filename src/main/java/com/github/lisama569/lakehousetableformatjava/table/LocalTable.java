@@ -3,12 +3,17 @@ package com.github.lisama569.lakehousetableformatjava.table;
 import com.github.lisama569.lakehousetableformatjava.exception.ConflictException;
 import com.github.lisama569.lakehousetableformatjava.exception.SchemaEvolutionException;
 import com.github.lisama569.lakehousetableformatjava.model.Column;
+import com.github.lisama569.lakehousetableformatjava.model.ColumnChange;
 import com.github.lisama569.lakehousetableformatjava.model.DataFileRef;
+import com.github.lisama569.lakehousetableformatjava.model.DataType;
+import com.github.lisama569.lakehousetableformatjava.model.DeleteRequest;
+import com.github.lisama569.lakehousetableformatjava.model.RetentionPolicy;
 import com.github.lisama569.lakehousetableformatjava.model.Row;
 import com.github.lisama569.lakehousetableformatjava.model.Schema;
 import com.github.lisama569.lakehousetableformatjava.model.SchemaChangeRequest;
 import com.github.lisama569.lakehousetableformatjava.model.Snapshot;
 import com.github.lisama569.lakehousetableformatjava.model.SnapshotOperation;
+import com.github.lisama569.lakehousetableformatjava.model.VacuumResult;
 import com.github.lisama569.lakehousetableformatjava.model.WriteMode;
 import com.github.lisama569.lakehousetableformatjava.model.WriteRequest;
 import com.github.lisama569.lakehousetableformatjava.model.WriteResult;
@@ -19,9 +24,12 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 /**
  * {@link Table} 的本地实现。
@@ -146,8 +154,11 @@ public final class LocalTable implements Table {
             // 以“待应用的列集合”逐步应用变更，使同一请求内 ADD+RENAME 可顺序生效
             List<Column> columns = new ArrayList<>(base.schema().columns());
             int nextId = columns.stream().mapToInt(Column::id).max().orElse(0) + 1;
+            // 记录本次请求内的改名（旧名 -> 新名），主键名随之更新；数据按列 ID 寻址，
+            // 所以主键改名与普通列改名一样不会错列
+            Map<String, String> renames = new LinkedHashMap<>();
 
-            for (com.github.lisama569.lakehousetableformatjava.model.ColumnChange change : request.changes()) {
+            for (ColumnChange change : request.changes()) {
                 if (change.kind() == null || change.columnName() == null) {
                     throw new SchemaEvolutionException("invalid schema change: " + change);
                 }
@@ -167,7 +178,7 @@ public final class LocalTable implements Table {
                                     "cannot add column, name already exists: " + spec.name());
                         }
                         var type = spec.type() == null
-                                ? com.github.lisama569.lakehousetableformatjava.model.DataType.STRING
+                                ? DataType.STRING
                                 : spec.type();
                         // 提前校验缺省值与类型匹配，避免脏 schema
                         if (spec.defaultValue() != null) {
@@ -203,6 +214,7 @@ public final class LocalTable implements Table {
                         // 关键：列 ID 保持不变，只改名字，历史文件按 ID 不会错列
                         columns.set(idx, new Column(oldCol.id(), change.newName(), oldCol.type(),
                                 oldCol.nullable(), oldCol.defaultValue()));
+                        renames.put(change.columnName(), change.newName());
                     }
                     case DROP -> {
                         if (idx < 0) {
@@ -219,17 +231,20 @@ public final class LocalTable implements Table {
                 }
             }
 
-            // 演进后主键列必须仍然存在
+            // 演进后主键列必须仍然存在（按列 ID 校验，名字可已被 RENAME 更新）
+            List<String> newPrimaryKey = new ArrayList<>();
             for (String pk : base.schema().primaryKey()) {
-                if (indexOfColumn(columns, pk) < 0) {
+                String pkName = renames.getOrDefault(pk, pk);
+                if (indexOfColumn(columns, pkName) < 0) {
                     throw new SchemaEvolutionException(
                             "primary key column missing after evolution: " + pk);
                 }
+                newPrimaryKey.add(pkName);
             }
 
             long newVersion = baseVersion + 1;
             Schema newSchema = new Schema(base.schema().version() + 1, columns,
-                    base.schema().primaryKey());
+                    newPrimaryKey);
             String snapshotId = newSnapshotId();
             // 结构变更不触碰数据文件，文件列表原样继承；行值按列 ID 解释
             Snapshot next = new Snapshot(newVersion, snapshotId, baseVersion, base.snapshotId(),
@@ -287,6 +302,145 @@ public final class LocalTable implements Table {
                     tableName, baseVersion, newVersion, snapshotId, base.files().size(),
                     beforeRecords, merged.size(), baseVersion);
             return next;
+        }
+    }
+
+    @Override
+    public WriteResult delete(DeleteRequest request) {
+        if (request == null || request.keys() == null) {
+            throw new IllegalArgumentException("delete request and keys must not be null");
+        }
+        if (request.keys().isEmpty()) {
+            throw new IllegalArgumentException("delete batch must contain at least one key");
+        }
+        synchronized (commitLock) {
+            long baseVersion = storage.readHeadVersion();
+            if (request.expectedVersion() != null && request.expectedVersion() != baseVersion) {
+                LOG.warn("[delete:reject] table={} reason=STALE_SNAPSHOT expectedVersion={} currentVersion={}",
+                        tableName, request.expectedVersion(), baseVersion);
+                throw new ConflictException(tableName, request.expectedVersion(), baseVersion);
+            }
+
+            Snapshot base = storage.readSnapshot(baseVersion);
+            TableData data = TableData.load(storage, base);
+            // 整批校验（不存在/重复/缺主键/多余列各自可区分），有任何问题不产生副作用
+            RecordValidator.Validated validated =
+                    RecordValidator.validateDelete(base.schema(), request.keys(), data.keys());
+            if (!validated.ok()) {
+                LOG.info("[delete:reject] table={} baseVersion={} rejectedCount={} reasons={}",
+                        tableName, baseVersion, validated.rejected().size(),
+                        validated.rejected().stream().map(r -> r.reason().name()).toList());
+                return new WriteResult(false, null, null, 0L, validated.rejected());
+            }
+
+            // 删除 = 追加一个只含墓碑行的新不可变文件；旧文件原样保留给历史快照。
+            // 墓碑与普通行走同一来源坐标合并规则：坐标更大的墓碑遮蔽旧行；
+            // 删除之后再次写入同主键，新行坐标更大，确定地重新可见。
+            long newVersion = baseVersion + 1;
+            DataFileRef tombstones = storage.writeDataFile(
+                    newVersion + "-delete.json", validated.rows(), newVersion);
+            List<DataFileRef> newFiles = new ArrayList<>(base.files());
+            newFiles.add(tombstones);
+
+            String snapshotId = newSnapshotId();
+            Snapshot next = new Snapshot(newVersion, snapshotId, baseVersion, base.snapshotId(),
+                    base.schema(), List.copyOf(newFiles), SnapshotOperation.DELETE,
+                    System.currentTimeMillis());
+            storage.writeSnapshot(next);
+            storage.casHead(baseVersion, newVersion);
+            LOG.info("[delete:accept] table={} baseVersion={} committedVersion={} snapshotId={} deleted={} filesAfter={} basis=tombstoneFile+headCAS(base={})",
+                    tableName, baseVersion, newVersion, snapshotId, validated.rows().size(),
+                    newFiles.size(), baseVersion);
+            return new WriteResult(true, newVersion, snapshotId, validated.rows().size(), List.of());
+        }
+    }
+
+    @Override
+    public VacuumResult vacuum(
+            RetentionPolicy policy) {
+        if (policy == null) {
+            throw new IllegalArgumentException("retention policy must not be null");
+        }
+        boolean byVersion = policy.minVersion() != null;
+        boolean byCount = policy.retainLastSnapshots() != null;
+        if (byVersion == byCount) {
+            throw new IllegalArgumentException(
+                    "exactly one of minVersion / retainLastSnapshots must be specified");
+        }
+        if (byCount && policy.retainLastSnapshots() < 1) {
+            throw new IllegalArgumentException("retainLastSnapshots must be >= 1");
+        }
+        synchronized (commitLock) {
+            long headAtStart = storage.readHeadVersion();
+            if (byVersion && (policy.minVersion() < 0 || policy.minVersion() > headAtStart)) {
+                throw new IllegalArgumentException("minVersion out of range [0, " + headAtStart + "]: "
+                        + policy.minVersion());
+            }
+            List<Snapshot> all = storage.readAllSnapshots();
+
+            // 1) 计算保留 / 过期快照集合（头快照一定在保留集合中）
+            List<Snapshot> retained;
+            if (byVersion) {
+                retained = all.stream()
+                        .filter(s -> s.version() >= policy.minVersion())
+                        .toList();
+            } else {
+                int n = policy.retainLastSnapshots();
+                int from = Math.max(0, all.size() - n);
+                retained = all.subList(from, all.size());
+            }
+            Set<Long> retainedVersions = retained.stream().map(Snapshot::version)
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+            List<Snapshot> expired = all.stream()
+                    .filter(s -> !retainedVersions.contains(s.version()))
+                    .toList();
+
+            // 2) 引用闭包：保留快照引用的文件一律保留；只有“被过期快照引用、
+            //    且不被任何保留快照引用”的文件才允许物理删除。
+            //    数据文件名按提交版本分配、永不复用，而新快照只能继承父快照
+            //    文件列表或引用更新版本的新文件，所以回收期间即使有跨进程并发
+            //    提交把 HEAD 推进，新快照引用的文件也绝不可能落入这个删除集合。
+            Set<String> retainedPaths = new LinkedHashSet<>();
+            for (Snapshot s : retained) {
+                for (DataFileRef f : s.files()) {
+                    retainedPaths.add(f.path());
+                }
+            }
+            Set<String> expiredOnlyPaths = new LinkedHashSet<>();
+            for (Snapshot s : expired) {
+                for (DataFileRef f : s.files()) {
+                    if (!retainedPaths.contains(f.path())) {
+                        expiredOnlyPaths.add(f.path());
+                    }
+                }
+            }
+
+            // 3) 先删过期快照文件，再删数据文件：中断时只可能留下无人引用的
+            //    垃圾文件，绝不可能让仍存在的快照指向已删除的文件。
+            for (Snapshot s : expired) {
+                storage.deleteSnapshotFile(s.version());
+            }
+            List<String> deletedFiles = new ArrayList<>();
+            for (String path : expiredOnlyPaths.stream().sorted().toList()) {
+                storage.deleteDataFile(path);
+                deletedFiles.add(path);
+            }
+
+            long headAtEnd = storage.readHeadVersion();
+            List<Long> expiredVersions = expired.stream().map(Snapshot::version)
+                    .sorted().toList();
+            List<Long> keptVersions = retained.stream().map(Snapshot::version)
+                    .sorted().toList();
+            List<String> keptFiles = retainedPaths.stream().sorted().toList();
+            LOG.info("[vacuum:accept] table={} headStart={} headEnd={} basis={} retainedSnapshots={} expiredSnapshots={} retainedFiles={} deletedFiles={} concurrentCommit={}",
+                    tableName, headAtStart, headAtEnd,
+                    byVersion ? "minVersion=" + policy.minVersion()
+                            : "retainLast=" + policy.retainLastSnapshots(),
+                    keptVersions, expiredVersions, keptFiles.size(), deletedFiles,
+                    headAtEnd != headAtStart);
+            return new VacuumResult(
+                    headAtStart, headAtEnd, keptVersions, expiredVersions,
+                    List.copyOf(deletedFiles), keptFiles);
         }
     }
 

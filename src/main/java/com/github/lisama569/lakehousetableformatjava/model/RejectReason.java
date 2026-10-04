@@ -13,5 +13,7 @@ public enum RejectReason {
     /** APPEND 模式下主键在表中已存在。 */
     PRIMARY_KEY_ALREADY_EXISTS,
     /** 同一批次内重复主键。 */
-    DUPLICATE_PRIMARY_KEY_IN_BATCH
+    DUPLICATE_PRIMARY_KEY_IN_BATCH,
+    /** DELETE 时主键在当前快照中不存在（或已被删除）。 */
+    PRIMARY_KEY_NOT_FOUND
 }

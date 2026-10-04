@@ -157,6 +157,111 @@ final class RecordValidator {
         return new Outcome(new Row(values), null);
     }
 
+    /**
+     * 校验一批 DELETE 主键，转换为只含主键列值的墓碑行。
+     *
+     * <p>可区分的拒绝原因（与写入共用同一套枚举）：
+     * <ul>
+     *   <li>{@code null} / 缺主键列 / 主键空 -> MISSING_PRIMARY_KEY；</li>
+     *   <li>出现非主键列 -> UNKNOWN_COLUMN（删除只按主键定位，不静默忽略多余字段）；</li>
+     *   <li>主键值类型不符 -> TYPE_MISMATCH；</li>
+     *   <li>批内同主键重复 -> DUPLICATE_PRIMARY_KEY_IN_BATCH；</li>
+     *   <li>主键在当前快照不存在（含已删除）-> PRIMARY_KEY_NOT_FOUND。</li>
+     * </ul>
+     *
+     * @param schema   当前（头快照）schema
+     * @param keys     批次主键，以列名为键
+     * @param existing 当前存活主键集合（墓碑键不在其中）
+     */
+    static Validated validateDelete(Schema schema,
+                                    List<Map<String, Object>> keys,
+                                    Set<String> existing) {
+        List<Row> rows = new ArrayList<>();
+        List<RejectedRecord> rejected = new ArrayList<>();
+        Set<String> seenInBatch = new HashSet<>();
+
+        for (int i = 0; i < keys.size(); i++) {
+            Map<String, Object> raw = keys.get(i);
+            RejectedRecord error = null;
+            if (raw == null) {
+                rejected.add(new RejectedRecord(i, null, RejectReason.MISSING_PRIMARY_KEY,
+                        "delete key is null", null));
+                continue;
+            }
+            // 删除请求只接受主键列：出现任何其它列名都明确拒绝
+            for (String keyName : raw.keySet()) {
+                Column col = schema.columnByName(keyName);
+                if (col == null) {
+                    error = new RejectedRecord(i, pkDisplay(raw, schema),
+                            RejectReason.UNKNOWN_COLUMN,
+                            "unknown column '" + keyName + "' for schema v" + schema.version(), raw);
+                    break;
+                }
+                if (!schema.primaryKey().contains(keyName)) {
+                    error = new RejectedRecord(i, pkDisplay(raw, schema),
+                            RejectReason.UNKNOWN_COLUMN,
+                            "delete accepts primary key columns only, '" + keyName
+                                    + "' is not part of the primary key", raw);
+                    break;
+                }
+            }
+            if (error != null) {
+                rejected.add(error);
+                continue;
+            }
+
+            List<Object> pkParts = new ArrayList<>();
+            List<String> missingPk = new ArrayList<>();
+            for (String pkName : schema.primaryKey()) {
+                Column col = schema.columnByName(pkName);
+                Object v = raw.get(pkName);
+                if (v == null || (v instanceof String s && s.isEmpty())) {
+                    missingPk.add(pkName);
+                    continue;
+                }
+                try {
+                    pkParts.add(col.type().coerce(v));
+                } catch (IllegalArgumentException e) {
+                    error = new RejectedRecord(i, null, RejectReason.TYPE_MISMATCH,
+                            "primary key column '" + pkName + "': " + e.getMessage(), raw);
+                    break;
+                }
+            }
+            if (error != null) {
+                rejected.add(error);
+                continue;
+            }
+            if (!missingPk.isEmpty()) {
+                rejected.add(new RejectedRecord(i, pkDisplay(raw, schema),
+                        RejectReason.MISSING_PRIMARY_KEY,
+                        "missing or empty primary key columns: " + missingPk, raw));
+                continue;
+            }
+
+            String primaryKeyValue = KeyCodec.encode(pkParts);
+            if (!seenInBatch.add(primaryKeyValue)) {
+                rejected.add(new RejectedRecord(i, primaryKeyValue,
+                        RejectReason.DUPLICATE_PRIMARY_KEY_IN_BATCH,
+                        "duplicate primary key within the same delete batch", raw));
+                continue;
+            }
+            if (!existing.contains(primaryKeyValue)) {
+                rejected.add(new RejectedRecord(i, primaryKeyValue,
+                        RejectReason.PRIMARY_KEY_NOT_FOUND,
+                        "primary key does not exist in the current snapshot (or already deleted)",
+                        raw));
+                continue;
+            }
+
+            Map<Integer, Object> values = new LinkedHashMap<>();
+            for (int p = 0; p < schema.primaryKey().size(); p++) {
+                values.put(schema.columnByName(schema.primaryKey().get(p)).id(), pkParts.get(p));
+            }
+            rows.add(new Row(values, true));
+        }
+        return new Validated(rows, rejected);
+    }
+
     private static Object coercedValue(Column col, Object v) {
         return col.type().coerce(v);
     }

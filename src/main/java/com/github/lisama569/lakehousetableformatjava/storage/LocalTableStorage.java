@@ -31,6 +31,9 @@ import java.util.stream.Stream;
  */
 public final class LocalTableStorage implements TableStorage {
 
+    private static final org.slf4j.Logger LOG =
+            org.slf4j.LoggerFactory.getLogger(LocalTableStorage.class);
+
     private static final String HEAD_FILE = "metadata/HEAD";
     private static final ObjectMapper MAPPER = JsonCodec.mapper();
     private static final TypeReference<List<Row>> ROW_LIST = new TypeReference<>() {
@@ -128,6 +131,47 @@ public final class LocalTableStorage implements TableStorage {
     public List<Row> readDataFile(String path) {
         Path target = path.startsWith("data/") ? tableDir.resolve(path) : tableDir.resolve("data").resolve(path);
         return readJson(target, ROW_LIST);
+    }
+
+    @Override
+    public void deleteSnapshotFile(long version) {
+        try {
+            boolean deleted = Files.deleteIfExists(snapshotPath(version));
+            if (deleted) {
+                LOG.info("[storage] deleted snapshot file snap-{}.json", version);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot delete snapshot version " + version, e);
+        }
+    }
+
+    @Override
+    public void deleteDataFile(String path) {
+        Path target = path.startsWith("data/") ? tableDir.resolve(path)
+                : tableDir.resolve("data").resolve(path);
+        try {
+            boolean deleted = Files.deleteIfExists(target);
+            if (deleted) {
+                LOG.info("[storage] deleted data file {}", path);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot delete data file " + path, e);
+        }
+    }
+
+    @Override
+    public List<String> listDataFiles() {
+        Path dataDir = tableDir.resolve("data");
+        try (Stream<Path> stream = Files.list(dataDir)) {
+            return stream
+                    .filter(Files::isRegularFile)
+                    .filter(p -> p.getFileName().toString().endsWith(".json"))
+                    .map(p -> "data/" + p.getFileName())
+                    .sorted()
+                    .toList();
+        } catch (IOException e) {
+            throw new UncheckedIOException("cannot list data files", e);
+        }
     }
 
     private Path snapshotPath(long version) {

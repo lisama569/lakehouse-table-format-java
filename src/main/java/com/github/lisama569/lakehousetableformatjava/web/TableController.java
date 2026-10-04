@@ -1,8 +1,11 @@
 package com.github.lisama569.lakehousetableformatjava.web;
 
 import com.github.lisama569.lakehousetableformatjava.model.ColumnSpec;
+import com.github.lisama569.lakehousetableformatjava.model.DeleteRequest;
+import com.github.lisama569.lakehousetableformatjava.model.RetentionPolicy;
 import com.github.lisama569.lakehousetableformatjava.model.SchemaChangeRequest;
 import com.github.lisama569.lakehousetableformatjava.model.Snapshot;
+import com.github.lisama569.lakehousetableformatjava.model.VacuumResult;
 import com.github.lisama569.lakehousetableformatjava.model.WriteRequest;
 import com.github.lisama569.lakehousetableformatjava.model.WriteResult;
 import com.github.lisama569.lakehousetableformatjava.service.TableService;
@@ -52,6 +55,16 @@ public class TableController {
     @PostMapping("/{name}/compact")
     public Snapshot compact(@PathVariable String name) {
         return tableService.compact(name);
+    }
+
+    @PostMapping("/{name}/delete")
+    public WriteResult delete(@PathVariable String name, @RequestBody DeleteRequest request) {
+        return tableService.delete(name, request);
+    }
+
+    @PostMapping("/{name}/vacuum")
+    public VacuumResult vacuum(@PathVariable String name, @RequestBody RetentionPolicy policy) {
+        return tableService.vacuum(name, policy);
     }
 
     @GetMapping("/{name}/rows")

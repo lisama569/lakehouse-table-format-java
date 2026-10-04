@@ -15,14 +15,22 @@ import java.util.Set;
 /**
  * 把快照引用的全部不可变数据文件按主键合并为当前有效行。
  *
- * <p>胜负规则（全局唯一，读取、MERGE 写入与 compaction 共用）：
+ * <p>胜负规则（全局唯一，读取、MERGE 写入、DELETE 与 compaction 共用）：
  * 比较行的来源坐标 {@code (commitVersion, seq)}，坐标大者胜。seq 是在快照
  * 文件列表内按“文件顺序 + 文件内行序”赋的全局单调序号，保证同一提交写入的
  * 多行也有确定先后（即最后写入胜出）。
+ *
+ * <p>删除以“墓碑行”（{@link Row#deleted()} = true）表示，与普通行走完全相同的
+ * 合并规则：坐标更大的墓碑覆盖旧值（读不到该行），坐标更大的新行又能覆盖墓碑
+ * （删除后重新插入）。墓碑不出现在 {@link #keys()} / {@link #liveRows()} 中，
+ * 但保留在合并结构里，确保旧版本文件里的值不会在合并/整理时“复活”。
  */
 final class TableData {
 
     record Entry(Row row, long commitVersion, long seq) {
+        boolean isTombstone() {
+            return row.deleted();
+        }
     }
 
     private final Map<String, Entry> live = new LinkedHashMap<>();
@@ -32,7 +40,7 @@ final class TableData {
         this.schema = schema;
     }
 
-    /** 加载快照下所有有效行（主键 -> 行）。 */
+    /** 加载快照下所有有效条目（主键 -> 最新条目，墓碑也在内）。 */
     static TableData load(TableStorage storage, Snapshot snapshot) {
         TableData data = new TableData(snapshot.schema());
         long seq = 0;
@@ -65,16 +73,26 @@ final class TableData {
         return KeyCodec.encode(parts);
     }
 
+    /** 该主键当前是否有“存活的行”（墓碑不算存活）。 */
     boolean contains(String key) {
-        return live.containsKey(key);
+        Entry e = live.get(key);
+        return e != null && !e.isTombstone();
     }
 
+    /** 当前存活行的主键集合（被删除的键不在其中，因此删除后可重新 APPEND）。 */
     Set<String> keys() {
-        return live.keySet();
+        Set<String> out = new java.util.LinkedHashSet<>();
+        for (Map.Entry<String, Entry> e : live.entrySet()) {
+            if (!e.getValue().isTombstone()) {
+                out.add(e.getKey());
+            }
+        }
+        return out;
     }
 
+    /** 当前存活行（墓碑被过滤），用于读取投影与 MERGE/compaction 重写。 */
     List<Row> liveRows() {
-        return live.values().stream().map(Entry::row).toList();
+        return live.values().stream().filter(e -> !e.isTombstone()).map(Entry::row).toList();
     }
 
     /**
