@@ -99,10 +99,12 @@ lakehouse-warehouse/<table>/
 
 - **与 compaction**：整理用与查询完全相同的合并规则，墓碑在重写时生效，
   被删行不会写进新文件——**整理后已删行不会复活**；旧文件不动，历史快照不受影响。
-- **与结构演进**：删除只按主键列定位行，主键列 ID 稳定；删行 / 加列 / 改名 /
-  删列任意穿插后，**每个历史快照仍按它当时的 schema 把值原样读出**
-  （列 ID 寻址保证不会把一列的值读到另一列上）。注意：主键列不允许 DROP，
-  也不允许 RENAME（演进后主键必须仍能解析，否则演进被拒绝）。
+- **与结构演进**：删除只按主键列定位行，主键以**稳定的列 ID** 锚定身份；
+  删行 / 加列 / 改名（**含主键列改名**）/ 删列任意穿插后，
+  **每个历史快照仍按它当时的 schema 把值原样读出**
+  （列 ID 寻址保证不会把一列的值读到另一列上）。注意：主键列不允许 DROP
+  （即使在同一批变更里先改名再删除也按列 ID 判为主键而拒绝），但**允许 RENAME**，
+  语义见 §4。
 
 ### 2.6 时间旅行（历史版本）
 
@@ -144,9 +146,40 @@ REST 层把领域异常映射为可区分状态码：`404 TABLE_NOT_FOUND`、
 
 | 操作 | 规则 |
 |---|---|
-| **ADD** | 分配新列 ID。旧行读取该列时：有 `defaultValue` 用缺省值，否则可空列为 `null`；**NOT NULL 且无缺省值的新列被拒绝**（旧行无法填充）；缺省值必须能按列类型解析。 |
-| **RENAME** | **只改列名、列 ID 不变**。历史快照仍用旧 schema（旧列名）复现；新快照用新列名读到同一份按 ID 存储的数据，**不会错列**。 |
-| **DROP** | 从新 schema 移除；历史快照保留旧 schema，旧列在历史版本中仍可读。**禁止删除主键列**。 |
+| **ADD** | 分配新列 ID。旧行读取该列时：有 `defaultValue` 用缺省值，否则可空列为 `null`；**NOT NULL 且无缺省值的新列被拒绝**（旧行无法填充）；缺省值必须能按列类型解析。新列名还必须合法（非空白、不含控制字符、两端无空白）。 |
+| **RENAME** | **只改列名、列 ID 不变**，普通列与**主键列一视同仁**（单列主键、复合主键中的任一列都可改）。历史快照仍用旧 schema（旧列名）复现；新快照用新列名读到同一份按 ID 存储的数据，**不会错列**。 |
+| **DROP** | 从新 schema 移除；历史快照保留旧 schema，旧列在历史版本中仍可读。**禁止删除主键列**（按列 ID 判定，同批先改名也无法绕过）。 |
+
+### 4.1 主键列改名（RENAME primary key column）
+
+主键的身份是**列 ID 的有序集合**，主键名只是每个快照 schema 里的一层投影。
+因此主键列改名与普通列改名是同一条机制：列 ID 不变、数据文件不触碰，
+只在新快照的 schema 里把主键声明中的旧名换成新名。
+
+- **改名后写入 / 合并 / 删除**：改名提交成功后，必须用**新主键列名**
+  APPEND / MERGE / DELETE；旧名字在新 schema 下会被当作 `UNKNOWN_COLUMN`。
+  - APPEND 不会把同列 ID 的既有主键误判为「已存在」——有效键集合仍按列 ID 求值。
+  - DELETE 按新名字给出的键与既有墓碑/数据行走同一套 `(commitVersion, seq)` 规则。
+- **复合主键**：可以只改其中一列，未改名的列保持原样；键的各部分仍按
+  各自稳定的列 ID 对齐，**不会出现一列读到另一列的值**。
+- **历史可见性**：改名之前的快照内嵌旧 schema，时间旅行到该版本仍用**旧列名**
+  读到原来的值；改名之后的快照用新列名。两个名字永不共存于同一快照。
+- **与删行 / 加列 / 删列 / 整理穿插**：主键改名只是一次普通的 SCHEMA_CHANGE
+  提交，可与这些操作任意穿插。整理（compaction）重写时按头快照 schema 的
+  主键列 ID 合并，墓碑照常生效，**已删除行不会在改名或整理后复活**；
+  删除后又写回同一主键（按新名）仍服从「更高提交版本胜出」的稳定规则。
+- **与保留回收**：改名不改动任何数据文件，快照/文件的引用关系完全不变，
+  retention 的「保留快照引用的文件不删」规则与改名前一致。
+- **失败边界（均返回 400 `INVALID_SCHEMA_EVOLUTION`，失败后版本不推进、
+  数据不变、不留半截状态，消息可区分）**：
+  新名与已有列重名（`target name already exists`）、
+  被改列不存在（`column not found`）、
+  新名为 null/空白（`new name must not be null or blank`）、
+  新名非法（两端空白或含控制字符，`control characters`/`whitespace`）。
+- **并发**：改名同样走表级锁 + OCC（`SchemaChangeRequest.expectedVersion`）。
+  基于同一过期基版本的两个改名提交恰好一个成功，另一个得到 409
+  `SNAPSHOT_CONFLICT`，**已提交的改名绝不会被覆盖**；输家刷新头版本、
+  在赢家给出的新列名上重试即可。
 
 新增列的缺省语义是**确定且稳定**的：补值只取决于列声明（`defaultValue` / 可空性），
 与查询时刻无关。演进同样受 OCC 保护（`SchemaChangeRequest.expectedVersion`）。
@@ -235,7 +268,7 @@ t.history();         // 全部已提交快照
 ## 8. 验证方法
 
 ```bash
-mvn test          # 运行全部 32 个测试
+mvn test          # 运行全部 39 个测试
 ```
 
 测试与覆盖点：
@@ -247,9 +280,10 @@ mvn test          # 运行全部 32 个测试
 | `SnapshotIsolationTest` | 每版可复现（含重开 catalog）、过期快照拒绝、演进 OCC |
 | `ConcurrentCommitTest` | 8 线程同基版本竞争：恰一成功、其余 SNAPSHOT_CONFLICT；刷新重试全部落地 |
 | `SchemaEvolutionTest` | ADD 缺省语义、RENAME 不错列、DROP 历史可读、非法演进、compaction 前后一致 |
+| `PrimaryKeyRenameTest` | 单列/复合主键改名后追加·合并·删除、逐快照按本版 schema 复现、与删行/加列/删列/整理穿插不复活、4 类失败边界无副作用、同基版本改名 OCC 恰一胜且重试落地、重开 catalog 持久化 |
 | `DeleteTest` | 删除可见性与历史保留、三类非法删除可区分且整批原子、删后重写规则、整理后不复活、与演进穿插不错列、旧格式文件兼容 |
 | `RetentionTest` | keepLast/retainFromVersion 两种策略、保留范围逐条一致、引用文件零误删、头快照钉住、并发提交与回收竞争、策略参数校验 |
-| `RestApiIntegrationTest` | HTTP 全生命周期（含删除与回收）与可区分错误码 |
+| `RestApiIntegrationTest` | HTTP 全生命周期（含删除、回收与**主键列改名**及可区分错误码） |
 
 测试日志会打印**提交版本、快照标识（snapshotId）与判定依据**，例如：
 
@@ -259,6 +293,10 @@ mvn test          # 运行全部 32 个测试
 [delete:reject] table=orders baseVersion=1 rejectedCount=3 reasons=[DUPLICATE_PRIMARY_KEY_IN_BATCH, PRIMARY_KEY_NOT_FOUND, MISSING_PRIMARY_KEY]
 [concurrent:reject] id=3 reason=SNAPSHOT_CONFLICT expectedVersion=0 currentVersion=1 basis=OCC
 [evolve] RENAME label->title columnId=2: history v1 reads label, head v2 reads title ...
+[evolve:accept] table=orders ... changes=[RENAME:id->orderId] primaryKey=[orderId] basis=headCAS(base=1)
+[pk-rename:use] appendV=3 mergeV=4 deleteV=5 ... basis=all keyed by new name orderId (columnId=1)
+[pk-rename:interleave] version=4 snapshotId=... op=DELETE pk=[itemSku] columns=[1:itemSku, 2:name] rows=1
+[pk-rename:concurrent:reject] loser=... reason=SNAPSHOT_CONFLICT expectedVersion=1 currentVersion=2 basis=OCC
 [compact] files 3->1, liveRows=4 ... results identical; history v1 still reproduces old value
 [retention:done] table=orders headVersion=5 policy=keepLastSnapshots=2 expiredSnapshots=[0,1,2,3] retainedSnapshots=[4,5] deletedFiles=3 retainedFiles=2 basis=commitLock+headReferenced
 ```
@@ -267,6 +305,7 @@ mvn test          # 运行全部 32 个测试
 
 ```bash
 mvn test -Dtest=ConcurrentCommitTest
+mvn test -Dtest=PrimaryKeyRenameTest   # 主键列改名（含复合主键、穿插、失败边界、OCC、持久化）
 ```
 
 ---
@@ -277,8 +316,9 @@ mvn test -Dtest=ConcurrentCommitTest
   一律按 `false` 处理，旧文件无需迁移即可继续读取、参与合并与删除
   （`DeleteTest.legacyDataFilesWithoutDeletedFlagRemainReadable` 验证）。
 - **快照文件**：快照结构未变，历史仓库的 `snap-*.json` 原样可用。
-- **API**：新增接口（`delete` / `expireSnapshots` / REST 两个端点）均为纯增量，
-  原有写入、演进、整理、查询语义不变（原有 20 个测试全部无回归）。
+- **API**：接口保持稳定；本次仅**放开**了原先对主键列 RENAME 的拒绝
+  （主键改名为纯 schema 投影变更，不动数据文件），写入、演进、整理、查询的
+  其余语义与历史仓库格式不变（原有 32 个测试全部无回归）。
 
 ---
 
@@ -287,6 +327,8 @@ mvn test -Dtest=ConcurrentCommitTest
 - **表级锁 + OCC + 原子 HEAD**：单 JVM 内由锁串行化，跨进程由原子 CAS 兜底，
   冲突可解释且绝不丢已提交数据。
 - **列 ID 寻址**：把「数据身份」与「列名」解耦，是改名/删列不错列、历史可复现的根因。
+  主键身份同样只是「列 ID 的有序集合」，所以主键列改名与普通列改名走同一条机制，
+  无需改写任何数据文件或墓碑。
 - **不可变文件 + 快照清单**：时间旅行与可重复读几乎零额外成本；compaction 只影响
   新快照，旧版本安然无恙。
 - **墓碑删除**：删除也是一次普通提交（新文件 + 新快照），复用统一的合并坐标规则，

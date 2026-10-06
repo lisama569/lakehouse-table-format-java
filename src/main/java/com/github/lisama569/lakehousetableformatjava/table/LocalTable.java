@@ -199,6 +199,10 @@ public final class LocalTable implements Table {
             // 以“待应用的列集合”逐步应用变更，使同一请求内 ADD+RENAME 可顺序生效
             List<Column> columns = new ArrayList<>(base.schema().columns());
             int nextId = columns.stream().mapToInt(Column::id).max().orElse(0) + 1;
+            // 主键列名随本批 RENAME 同步更新（按列 ID 锚定身份）；
+            // 主键列的 DROP 以 base schema 的列 ID 判定，不受同批改名影响。
+            Set<Integer> pkIds = Set.copyOf(base.schema().primaryKeyIds());
+            List<String> pkNames = new ArrayList<>(base.schema().primaryKey());
 
             for (com.github.lisama569.lakehousetableformatjava.model.ColumnChange change : request.changes()) {
                 if (change.kind() == null || change.columnName() == null) {
@@ -212,8 +216,13 @@ public final class LocalTable implements Table {
                                     "cannot add column, name already exists: " + change.columnName());
                         }
                         var spec = change.spec();
-                        if (spec == null || spec.name() == null || spec.name().isBlank()) {
+                        if (spec == null || ColumnNames.isBlank(spec.name())) {
                             throw new SchemaEvolutionException("ADD requires a valid column spec");
+                        }
+                        if (!ColumnNames.isValid(spec.name())) {
+                            throw new SchemaEvolutionException(
+                                    "illegal new column name '" + spec.name()
+                                            + "': must not have leading/trailing whitespace or control characters");
                         }
                         if (indexOfColumn(columns, spec.name()) >= 0) {
                             throw new SchemaEvolutionException(
@@ -241,12 +250,21 @@ public final class LocalTable implements Table {
                                 spec.defaultValue()));
                     }
                     case RENAME -> {
+                        // 失败原因必须可区分：列不存在 / 新名为空白 / 新名非法 / 新名已存在
                         if (idx < 0) {
                             throw new SchemaEvolutionException(
                                     "cannot rename, column not found: " + change.columnName());
                         }
-                        if (change.newName() == null || change.newName().isBlank()) {
-                            throw new SchemaEvolutionException("RENAME requires a non-blank new name");
+                        if (ColumnNames.isBlank(change.newName())) {
+                            throw new SchemaEvolutionException(
+                                    "cannot rename '" + change.columnName()
+                                            + "': new name must not be null or blank");
+                        }
+                        if (!ColumnNames.isValid(change.newName())) {
+                            throw new SchemaEvolutionException(
+                                    "cannot rename '" + change.columnName() + "' to '" + change.newName()
+                                            + "': new name must not have leading/trailing whitespace"
+                                            + " or control characters");
                         }
                         if (indexOfColumn(columns, change.newName()) >= 0) {
                             throw new SchemaEvolutionException(
@@ -256,13 +274,21 @@ public final class LocalTable implements Table {
                         // 关键：列 ID 保持不变，只改名字，历史文件按 ID 不会错列
                         columns.set(idx, new Column(oldCol.id(), change.newName(), oldCol.type(),
                                 oldCol.nullable(), oldCol.defaultValue()));
+                        // 主键列同样允许改名：按列 ID 把主键声明里的旧名换成新名，
+                        // 主键身份（列 ID 集合）不变，数据文件与墓碑无需改动。
+                        for (int p = 0; p < pkNames.size(); p++) {
+                            if (pkNames.get(p).equals(change.columnName())) {
+                                pkNames.set(p, change.newName());
+                            }
+                        }
                     }
                     case DROP -> {
                         if (idx < 0) {
                             throw new SchemaEvolutionException(
                                     "cannot drop, column not found: " + change.columnName());
                         }
-                        if (base.schema().primaryKey().contains(change.columnName())) {
+                        // 以列 ID 判定主键：主键列在同批先改名也依然禁止删除
+                        if (pkIds.contains(columns.get(idx).id())) {
                             throw new SchemaEvolutionException(
                                     "cannot drop a primary key column: " + change.columnName());
                         }
@@ -272,8 +298,8 @@ public final class LocalTable implements Table {
                 }
             }
 
-            // 演进后主键列必须仍然存在
-            for (String pk : base.schema().primaryKey()) {
+            // 演进后主键列必须仍然存在（按当前列名集合核对，主键改名后用新名）
+            for (String pk : pkNames) {
                 if (indexOfColumn(columns, pk) < 0) {
                     throw new SchemaEvolutionException(
                             "primary key column missing after evolution: " + pk);
@@ -281,8 +307,7 @@ public final class LocalTable implements Table {
             }
 
             long newVersion = baseVersion + 1;
-            Schema newSchema = new Schema(base.schema().version() + 1, columns,
-                    base.schema().primaryKey());
+            Schema newSchema = new Schema(base.schema().version() + 1, columns, pkNames);
             String snapshotId = newSnapshotId();
             // 结构变更不触碰数据文件，文件列表原样继承；行值按列 ID 解释
             Snapshot next = new Snapshot(newVersion, snapshotId, baseVersion, base.snapshotId(),
@@ -290,10 +315,12 @@ public final class LocalTable implements Table {
                     System.currentTimeMillis());
             storage.writeSnapshot(next);
             storage.casHead(baseVersion, newVersion);
-            LOG.info("[evolve:accept] table={} baseVersion={} committedVersion={} snapshotId={} schemaVersion={} changes={} basis=headCAS(base={})",
+            LOG.info("[evolve:accept] table={} baseVersion={} committedVersion={} snapshotId={} schemaVersion={} changes={} primaryKey={} basis=headCAS(base={})",
                     tableName, baseVersion, newVersion, snapshotId, newSchema.version(),
-                    request.changes().stream().map(c -> c.kind() + ":" + c.columnName()).toList(),
-                    baseVersion);
+                    request.changes().stream().map(c -> c.kind() + ":" + c.columnName()
+                            + (c.kind() == com.github.lisama569.lakehousetableformatjava.model.ColumnChange.Kind.RENAME
+                                    ? "->" + c.newName() : "")).toList(),
+                    newSchema.primaryKey(), baseVersion);
             return next;
         }
     }

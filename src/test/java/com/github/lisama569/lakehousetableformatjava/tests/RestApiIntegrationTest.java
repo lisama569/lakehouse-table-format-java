@@ -124,8 +124,74 @@ class RestApiIntegrationTest {
     }
 
     @Test
-    void unknownTableAndTableErrorsAreMapped() throws Exception {
-        mvc.perform(get("/api/tables/ghost/rows"))
+    void primaryKeyRenameOverHttpThenWriteDeleteAndHistoryAllWork() throws Exception {
+        // 复合主键建表
+        String createBody = """
+                {"columns":[
+                  {"name":"tenant","type":"LONG","nullable":false},
+                  {"name":"sku","type":"LONG","nullable":false},
+                  {"name":"v","type":"STRING","nullable":true}
+                ],"primaryKey":["tenant","sku"]}""";
+        mvc.perform(post("/api/tables/inventory").contentType(MediaType.APPLICATION_JSON).content(createBody))
+                .andExpect(status().isOk());
+        mvc.perform(post("/api/tables/inventory/write").contentType(MediaType.APPLICATION_JSON).content("""
+                {"mode":"APPEND","expectedVersion":0,
+                 "records":[{"tenant":1,"sku":10,"v":"a"},{"tenant":2,"sku":20,"v":"b"}]}"""))
+                .andExpect(jsonPath("$.committed").value(true))
+                .andExpect(jsonPath("$.committedVersion").value(1));
+
+        // 主键列改名 sku -> itemSku，提交为 v2
+        String rename = """
+                {"expectedVersion":1,"changes":[{"kind":"RENAME","columnName":"sku","newName":"itemSku"}]}""";
+        mvc.perform(post("/api/tables/inventory/schema").contentType(MediaType.APPLICATION_JSON).content(rename))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.version").value(2))
+                .andExpect(jsonPath("$.schema.primaryKey[1]").value("itemSku"));
+        LOG.info("[rest] primary key column sku->itemSku committed -> v2, tenant unchanged");
+
+        // 历史 v1 仍按旧名 sku 读出
+        mvc.perform(get("/api/tables/inventory/rows?version=1"))
+                .andExpect(jsonPath("$[0].sku").value(10))
+                .andExpect(jsonPath("$[0].itemSku").doesNotExist());
+        // 头快照用新主键名读到原值
+        mvc.perform(get("/api/tables/inventory/rows"))
+                .andExpect(jsonPath("$[0].itemSku").value(10));
+
+        // 用新主键名追加
+        mvc.perform(post("/api/tables/inventory/write").contentType(MediaType.APPLICATION_JSON).content("""
+                {"mode":"APPEND","expectedVersion":2,
+                 "records":[{"tenant":1,"itemSku":30,"v":"c"}]}"""))
+                .andExpect(jsonPath("$.committed").value(true))
+                .andExpect(jsonPath("$.committedVersion").value(3));
+        // 用新主键名按主键删除
+        mvc.perform(post("/api/tables/inventory/delete").contentType(MediaType.APPLICATION_JSON).content("""
+                {"expectedVersion":3,"keys":[{"tenant":2,"itemSku":20}]}"""))
+                .andExpect(jsonPath("$.committed").value(true))
+                .andExpect(jsonPath("$.committedVersion").value(4));
+        mvc.perform(get("/api/tables/inventory/rows"))
+                .andExpect(jsonPath("$.length()").value(2));
+        LOG.info("[rest] append/delete by renamed composite key itemSku OK -> head v4");
+
+        // 改成已存在列名 -> 400 INVALID_SCHEMA_EVOLUTION，版本不推进
+        mvc.perform(post("/api/tables/inventory/schema").contentType(MediaType.APPLICATION_JSON).content("""
+                {"expectedVersion":4,"changes":[{"kind":"RENAME","columnName":"tenant","newName":"v"}]}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("INVALID_SCHEMA_EVOLUTION"));
+        // 空白新名 -> 400，原因可区分
+        mvc.perform(post("/api/tables/inventory/schema").contentType(MediaType.APPLICATION_JSON).content("""
+                {"expectedVersion":4,"changes":[{"kind":"RENAME","columnName":"tenant","newName":"   "}]}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errorCode").value("INVALID_SCHEMA_EVOLUTION"));
+        // 过期基版本改名 -> 409 SNAPSHOT_CONFLICT
+        mvc.perform(post("/api/tables/inventory/schema").contentType(MediaType.APPLICATION_JSON).content("""
+                {"expectedVersion":1,"changes":[{"kind":"RENAME","columnName":"tenant","newName":"org"}]}"""))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.errorCode").value("SNAPSHOT_CONFLICT"));
+        LOG.warn("[rest:reject] pk rename duplicate/blank -> 400, stale base -> 409; head stays v4");
+    }
+
+    @Test
+    void unknownTableAndTableErrorsAreMapped() throws Exception {        mvc.perform(get("/api/tables/ghost/rows"))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.errorCode").value("TABLE_NOT_FOUND"));
         LOG.warn("[rest:reject] HTTP 404 errorCode=TABLE_NOT_FOUND");
