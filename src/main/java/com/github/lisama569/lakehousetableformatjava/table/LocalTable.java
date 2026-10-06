@@ -196,8 +196,10 @@ public final class LocalTable implements Table {
             }
             Snapshot base = storage.readSnapshot(baseVersion);
 
-            // 以“待应用的列集合”逐步应用变更，使同一请求内 ADD+RENAME 可顺序生效
+            // 以“待应用的列集合 + 待应用的主键定义”逐步应用变更，
+            // 使同一请求内 ADD+RENAME 可顺序生效；主键列改名时主键定义跟随列走
             List<Column> columns = new ArrayList<>(base.schema().columns());
+            List<String> primaryKey = new ArrayList<>(base.schema().primaryKey());
             int nextId = columns.stream().mapToInt(Column::id).max().orElse(0) + 1;
 
             for (com.github.lisama569.lakehousetableformatjava.model.ColumnChange change : request.changes()) {
@@ -215,6 +217,7 @@ public final class LocalTable implements Table {
                         if (spec == null || spec.name() == null || spec.name().isBlank()) {
                             throw new SchemaEvolutionException("ADD requires a valid column spec");
                         }
+                        requireLegalColumnName(spec.name());
                         if (indexOfColumn(columns, spec.name()) >= 0) {
                             throw new SchemaEvolutionException(
                                     "cannot add column, name already exists: " + spec.name());
@@ -248,6 +251,7 @@ public final class LocalTable implements Table {
                         if (change.newName() == null || change.newName().isBlank()) {
                             throw new SchemaEvolutionException("RENAME requires a non-blank new name");
                         }
+                        requireLegalColumnName(change.newName());
                         if (indexOfColumn(columns, change.newName()) >= 0) {
                             throw new SchemaEvolutionException(
                                     "cannot rename, target name already exists: " + change.newName());
@@ -256,13 +260,20 @@ public final class LocalTable implements Table {
                         // 关键：列 ID 保持不变，只改名字，历史文件按 ID 不会错列
                         columns.set(idx, new Column(oldCol.id(), change.newName(), oldCol.type(),
                                 oldCol.nullable(), oldCol.defaultValue()));
+                        // 主键列改名：主键定义跟随列走（列 ID 不变，主键值编码不变），
+                        // 因此改名后用新名字写入/删除与改名前的数据无缝衔接
+                        for (int i = 0; i < primaryKey.size(); i++) {
+                            if (primaryKey.get(i).equals(change.columnName())) {
+                                primaryKey.set(i, change.newName());
+                            }
+                        }
                     }
                     case DROP -> {
                         if (idx < 0) {
                             throw new SchemaEvolutionException(
                                     "cannot drop, column not found: " + change.columnName());
                         }
-                        if (base.schema().primaryKey().contains(change.columnName())) {
+                        if (primaryKey.contains(change.columnName())) {
                             throw new SchemaEvolutionException(
                                     "cannot drop a primary key column: " + change.columnName());
                         }
@@ -272,8 +283,8 @@ public final class LocalTable implements Table {
                 }
             }
 
-            // 演进后主键列必须仍然存在
-            for (String pk : base.schema().primaryKey()) {
+            // 演进后主键列必须仍然存在（主键定义已随 RENAME 同步更新）
+            for (String pk : primaryKey) {
                 if (indexOfColumn(columns, pk) < 0) {
                     throw new SchemaEvolutionException(
                             "primary key column missing after evolution: " + pk);
@@ -281,8 +292,7 @@ public final class LocalTable implements Table {
             }
 
             long newVersion = baseVersion + 1;
-            Schema newSchema = new Schema(base.schema().version() + 1, columns,
-                    base.schema().primaryKey());
+            Schema newSchema = new Schema(base.schema().version() + 1, columns, primaryKey);
             String snapshotId = newSnapshotId();
             // 结构变更不触碰数据文件，文件列表原样继承；行值按列 ID 解释
             Snapshot next = new Snapshot(newVersion, snapshotId, baseVersion, base.snapshotId(),
@@ -305,6 +315,20 @@ public final class LocalTable implements Table {
             }
         }
         return -1;
+    }
+
+    /**
+     * 列名合法性：非空白（调用方已给出更具体的空白提示）且不含 ISO 控制字符。
+     * 控制字符（含复合主键编码使用的 U+001F 分隔符）会破坏键编码与日志/文件
+     * 的可读性，因此在演进入口统一拒绝，与空白、重名是三种可区分的失败原因。
+     */
+    private static void requireLegalColumnName(String name) {
+        for (int i = 0; i < name.length(); i++) {
+            if (Character.isISOControl(name.charAt(i))) {
+                throw new SchemaEvolutionException(
+                        "illegal column name (contains control character): " + name);
+            }
+        }
     }
 
     @Override
